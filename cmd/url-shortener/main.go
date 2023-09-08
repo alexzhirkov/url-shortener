@@ -1,20 +1,24 @@
 package main
 
 import (
+	"bufio"
+	"context"
+	"fmt"
 	"github.com/alexzhirkov/url-shortener/internal/config"
+	http_handler "github.com/alexzhirkov/url-shortener/internal/handlers/http"
+	http_server "github.com/alexzhirkov/url-shortener/internal/lib/http-server"
 	"github.com/alexzhirkov/url-shortener/internal/lib/logger/sl"
-	"github.com/alexzhirkov/url-shortener/internal/storage/sqlite"
+	"github.com/alexzhirkov/url-shortener/internal/repository/url_repository/sqlite"
+	"github.com/alexzhirkov/url-shortener/internal/usecases"
+	"github.com/gin-contrib/requestid"
+	"github.com/gin-gonic/gin"
+	"io"
 	"log"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
-)
-
-const (
-	envLocal = "local"
-	envDev   = "dev"
-	envProd  = "prod"
 )
 
 func main() {
@@ -25,67 +29,82 @@ func main() {
 }
 
 func run() error {
-	//init config
+
+	var r io.Reader
+	r = os.Stdin
+	r = bufio.NewReader(r)
+	//r = new(bytes.Buffer)
+
+	//init.go config
 	cfg := config.MustLoad()
 
-	//init logger
-	logger := setupLogger(cfg.Env)
+	//init.go logger
+	logger := sl.SetupLogger(cfg.Env)
 
 	//logger.With(slog.String("env", cfg.Env)).Info("info message")
-	logger.Info("start url-shortener", slog.String("env", cfg.Env))
+	logger.Info("start http-shortener", slog.String("env", cfg.Env))
 	//logger.Debug("debug message")
 
-	//todo: init storage: sqlite
-	storage, err := sqlite.New(cfg.StoragePath)
+	//adapters: sqlite
+	urlStore, err := sqlite.New(cfg.StoragePath)
 	if err != nil {
-		logger.Error("storage initialization failed", sl.Err(err))
-		os.Exit(1)
+		logger.Error("adapters initialization failed", sl.Err(err))
+		return fmt.Errorf("adapters initialization failed: %v", err)
 	}
-	_ = storage
+	useCase, err := usecases.New(usecases.WithUrlRepository(urlStore))
+	//useCase, err := usecases.New(usecases.WithUrlRepository(in_memory.New()))
+	//useCase, err := usecases.New(usecases.WithMemoryRepository())
+	if err != nil {
+		return fmt.Errorf("usecases initialization failed: %v", err)
+	}
+	HTTPHandler := http_handler.NewHTTPHandler(useCase)
 
-	//todo: init router: chi
+	//init.go router: gin
+	gin.SetMode(gin.ReleaseMode) //switch off warnings
+	//router := gin.New()	//without recoverer and logger
+	router := gin.Default()
 
-	//todo: run server
+	//middleware
+	//router.Use()
+	router.Use(requestid.New())
 
-	// listen to OS signals and gracefully shutdown HTTP server
-	stopped := make(chan struct{})
-	go func() {
-		sigint := make(chan os.Signal, 1)
-		signal.Notify(sigint, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
-		<-sigint
-		//ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		//defer cancel()
-		//if err := srv.Shutdown(ctx); err != nil {
-		//	log.Printf("HTTP Server Shutdown Error: %v", err)
-		//}
-		close(stopped)
-	}()
+	//router.Use(gin.BasicAuth(gin.Accounts{"alex": "pass"}))//авторизация. встроенная только basic
+	//выключим пока, чтобы смотреть в браузере
+	//router.Use(middleware.EnsureLoggedIn()) //Bearer авторизация
+	//router.Use(middleware.Logger)	//потом
 
-	//log.Printf("Starting HTTP server on %s", cfg.HTTPAddr)
+	router.GET("/", func(c *gin.Context) {
+		c.String(http.StatusOK, "id:"+requestid.Get(c))
+	})
+	router.GET("/get/:alias", HTTPHandler.GetUrl)
+	router.POST("/create", HTTPHandler.CreateUrl)
+	router.GET("/count", HTTPHandler.CountUrls)
+	//run server
+	//router.Run(cfg.Address)
 
-	// start HTTP server
-	//if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-	//	log.Fatalf("HTTP server ListenAndServe Error: %v", err)
-	//}
+	// Create the HTTP server
+	httpServer := http_server.NewHttpServer(
+		router,
+		cfg.HttpServer,
+	)
 
-	<-stopped
-
-	log.Printf("Have a nice day!")
+	// Start the HTTP server
+	httpServer.Start()
+	defer httpServer.Stop()
+	// Listen for OS signals to perform a graceful shutdown
+	//c := make(chan os.Signal, 1)
+	ctx, cancel := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGHUP,
+		syscall.SIGINT,
+		syscall.SIGQUIT,
+		syscall.SIGTERM,
+	)
+	_ = cancel //call it to initiate shutdown
+	log.Println("listening signals...")
+	<-ctx.Done()
+	log.Println("graceful shutdown...")
 
 	return nil
-}
-
-func setupLogger(env string) *slog.Logger {
-	var logger *slog.Logger
-
-	switch env {
-	case envLocal:
-		logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	case envDev:
-		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	case envProd:
-		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	}
-
-	return logger
 }
